@@ -2,8 +2,8 @@
 """
 🤖 بوت تيليجرام – استخراج ايبيات شغّالة فعلياً (متحقَّق منها حيّاً)
 ════════════════════════════════════════════════════════════════
-• زر «🚀 استخراج ايبيات» يرسل ملف txt فيه حتى IPS_PER_REQUEST ايبي (افتراضياً 10,000)
-  في كل ضغطة — وكلها ايبيات تم التحقق من أنها شغّالة فعلياً، وليست مولَّدة عشوائياً.
+• زر «🚀 استخراج ايبيات» يطلب منك إرسال الموقع المستهدف وعدد الايبيات المطلوبة، 
+  ثم يرسل لك ملف txt يحتوي على الايبيات مع إدراج الموقع كملاحظة بالملف.
 • زر «🧪 تجربة ايبي شغّال» (جديد): يختار ايبي واحد من المخزون الشغّال ويرسل طلب
   HTTP تجريبي واحد فقط عبره إلى موقع محدَّد (TEST_URL) ليُظهر لك مباشرة أنه فعلاً
   يعمل (حالة الاستجابة + زمن الاستجابة).
@@ -61,6 +61,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 try:
@@ -468,8 +470,8 @@ _BG_TASKS: set[asyncio.Task] = set()
 WELCOME = (
     "أهلاً <b>{name}</b> 👋\n\n"
     "🌐 <b>بوت استخراج الايبيات الشغّالة فعلاً</b>\n"
-    "اضغط «استخراج» وسيصلك ملف فيه حتى <b>{n:,}</b> ايبي — كلها تم التحقق من أنها "
-    "شغّالة فعلياً (وليست عشوائية) وبدون تكرار.\n"
+    "اضغط «استخراج» لتحديد الموقع الذي تريد الإرسال له وعدد الايبيات المطلوبة، وسيصلك ملف "
+    "بها — كلها تم التحقق من أنها شغّالة فعلياً (وليست عشوائية) وبدون تكرار.\n"
     "أو جرّب زر «🧪 تجربة ايبي شغّال» لترى ايبياً واحداً وهو يرسل طلباً حقيقياً "
     "إلى الموقع المحدَّد أمامك مباشرة."
 )
@@ -498,70 +500,101 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if ALLOWED_USERS and user.id not in ALLOWED_USERS:
         await update.effective_message.reply_text("⛔ هذا البوت خاص.")
         return
+    context.user_data.clear()
     await update.effective_message.reply_text(
-        WELCOME.format(name=html.escape(user.first_name or ""), n=IPS_PER_REQUEST),
+        WELCOME.format(name=html.escape(user.first_name or "")),
         reply_markup=main_menu(),
         parse_mode=ParseMode.HTML,
     )
 
 
-async def do_extract(query, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = query.from_user.id
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يلتقط ردود المستخدم (الموقع وعدد الايبيات) عند طلب الاستخراج."""
+    if ALLOWED_USERS and update.effective_user.id not in ALLOWED_USERS:
+        return
+    
+    state = context.user_data.get('state')
+    
+    if state == 'WAIT_URL':
+        context.user_data['target_url'] = update.message.text.strip()
+        context.user_data['state'] = 'WAIT_COUNT'
+        await update.message.reply_text("كم عدد الطلبات (الايبيات) التي تريد استخراجها؟ (مثال: 1000)")
+        
+    elif state == 'WAIT_COUNT':
+        text = update.message.text.strip()
+        if not text.isdigit():
+            await update.message.reply_text("❌ الرجاء إرسال رقم صحيح.")
+            return
+        count = int(text)
+        if count <= 0:
+            await update.message.reply_text("❌ الرجاء إرسال رقم أكبر من الصفر.")
+            return
+            
+        context.user_data['state'] = None
+        target_url = context.user_data.get('target_url', 'غير محدد')
+        await process_extraction(update, context, target_url, count)
+
+
+async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, target_url: str, requested_count: int) -> None:
+    uid = update.effective_user.id
     now = time.monotonic()
 
     if uid in BUSY:
-        await query.answer("⏳ جارِ تجهيز طلبك السابق...")
+        await update.message.reply_text("⏳ جارِ تجهيز طلبك السابق...")
         return
     wait = COOLDOWN - (now - LAST_USE.get(uid, -1e9))
     if wait > 0:
-        await query.answer(f"⏳ انتظر {int(wait) + 1} ثانية")
+        await update.message.reply_text(f"⏳ انتظر {int(wait) + 1} ثانية")
         return
 
     BUSY.add(uid)
     LAST_USE[uid] = now
     try:
-        await query.answer()
-        await safe_edit(query, "⏳ <b>جارِ تجهيز الايبيات الشغّالة...</b>")
+        msg = await update.message.reply_text("⏳ <b>جارِ تجهيز الايبيات الشغّالة...</b>", parse_mode=ParseMode.HTML)
         await POOL.ensure_fresh()
         if not POOL.verified:
-            await safe_edit(
-                query,
+            await msg.edit_text(
                 "⚠️ لم يكتمل التحقق من أي ايبي حتى الآن.\n"
                 "البوت يتحقق في الخلفية باستمرار — حاول خلال دقيقة.",
-                main_menu(),
+                reply_markup=main_menu()
             )
             return
 
-        ips, reset, remaining = POOL.draw(uid, IPS_PER_REQUEST)
+        ips, reset, remaining = POOL.draw(uid, requested_count)
         lines = sorted({format_ip(ip) for ip in ips})
+        
+        # إضافة الموقع كملاحظة في رأس الملف
+        file_content = f"# الموقع المستهدف: {target_url}\n# عدد الايبيات: {len(lines)}\n\n" + "\n".join(lines)
+
         caption = [
             f"✅ <b>تم استخراج {len(lines):,} ايبي (شغّال فعلاً، متحقَّق منه حيّاً)</b>",
+            f"🔗 الموقع المستهدف: <code>{html.escape(target_url)}</code>",
             f"🔒 المتبقي لك بدون تكرار: {remaining:,}",
             f"🗂 إجمالي المخزون الشغّال حالياً: {len(POOL.verified):,}",
         ]
-        if len(POOL.verified) < IPS_PER_REQUEST:
+        if len(POOL.verified) < requested_count:
             caption.append(
-                f"ℹ️ العدد الشغّال فعلياً الآن أقل من الهدف ({IPS_PER_REQUEST:,})، "
+                f"ℹ️ العدد الشغّال فعلياً الآن أقل من المطلوب ({requested_count:,})، "
                 "والبوت يواصل التحقق من المزيد في الخلفية تلقائياً."
             )
         if reset:
             caption.append("♻️ انتهت الايبيات الجديدة فبدأت دورة جديدة.")
 
         await context.bot.send_document(
-            chat_id=query.message.chat_id,
-            document="\n".join(lines).encode("utf-8"),
+            chat_id=update.message.chat_id,
+            document=file_content.encode("utf-8"),
             filename=time.strftime("ips_%Y%m%d_%H%M%S.txt"),
             caption="\n".join(caption),
             parse_mode=ParseMode.HTML,
         )
-        await safe_edit(
-            query,
-            "✅ <b>تم الإرسال!</b>\nاضغط مرة أخرى لسحب دفعة جديدة مختلفة 👇",
-            main_menu(),
+        await msg.edit_text(
+            "✅ <b>تم الإرسال بنجاح!</b>\nاضغط مرة أخرى لسحب دفعة جديدة مختلفة 👇",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML
         )
     except Exception:  # noqa: BLE001
         log.exception("فشل الاستخراج")
-        await safe_edit(query, "❌ حدث خطأ، حاول مرة أخرى.", main_menu())
+        await update.message.reply_text("❌ حدث خطأ، حاول مرة أخرى.", reply_markup=main_menu())
     finally:
         BUSY.discard(uid)
 
@@ -616,7 +649,7 @@ async def do_status(query) -> None:
         f"✅ مصادر شغالة: <b>{ok}</b> من {len(POOL.stats)}",
         f"🧪 ايبيات شغّالة فعلاً (متحقَّق منها حيّاً): <b>{len(POOL.verified):,}</b>",
         f"📥 إجمالي المرشّحين (قبل التحقق): <b>{len(POOL.candidates):,}</b>",
-        f"🎯 الهدف لكل سحب: <b>{IPS_PER_REQUEST:,}</b>",
+        f"🎯 الهدف الثابت المتوفر في الخلفية: <b>{IPS_PER_REQUEST:,}</b>",
         f"🔗 موقع التحقق/التجربة الحالي: <code>{html.escape(TEST_URL)}</code>",
         f"🕒 آخر تحديث للمصادر: قبل {age} دقيقة",
     ]
@@ -634,7 +667,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("⛔ هذا البوت خاص", show_alert=True)
         return
     if query.data == "extract":
-        await do_extract(query, context)
+        context.user_data['state'] = 'WAIT_URL'
+        await safe_edit(query, "الرجاء إرسال الموقع (URL) الذي تريد إرسال الطلبات له:")
     elif query.data == "test":
         await do_test(query)
     elif query.data == "status":
@@ -683,6 +717,8 @@ def main() -> None:
     )
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CallbackQueryHandler(on_button))
+    # التقاط الردود (الرابط والعدد)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
 
     log.info("🤖 البوت يعمل الآن... (الهدف: %d ايبي شغّال، الموقع: %s)", IPS_PER_REQUEST, TEST_URL)
