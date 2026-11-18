@@ -1,0 +1,41 @@
+# ضع هذا الملف في المسار:  .github/workflows/bot.yml
+name: Telegram IP Bot
+
+on:
+  workflow_dispatch:            # تشغيل يدوي: تبويب Actions ← Run workflow
+  push:
+    branches: [main, master]    # إعادة تشغيل البوت عند كل تعديل في الكود
+  schedule:
+    - cron: "0 */6 * * *"       # إعادة تشغيل تلقائي كل 6 ساعات (حد GitHub لكل job)
+
+# نسخة واحدة فقط من البوت في نفس الوقت (تجنّباً لخطأ Conflict في تيليجرام)
+concurrency:
+  group: telegram-ip-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360        # الحد الأقصى المسموح لـ job واحد
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}          # إجباري
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}  # اختياري: آيديات مفصولة بفاصلة
+        run: python bot.py
